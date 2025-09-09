@@ -1,69 +1,65 @@
-import { SlashCommandBuilder, EmbedBuilder } from "discord.js";
-import Wallet from "../../src/database/Wallet.js";
+import { SlashCommandBuilder } from "discord.js";
 import mongoose from "mongoose";
+import Wallet from "../../src/database/Wallet.js";
 
-// Hit contracts schema
-const hitSchema = new mongoose.Schema({
-  targetId: String,
-  bounty: Number,
-  createdBy: String,
-  active: { type: Boolean, default: true },
-  createdAt: { type: Date, default: Date.now }
-});
-const Hit = mongoose.models.Hit || mongoose.model("Hit", hitSchema);
+// Use the same Hit model definition (will reuse if already compiled)
+const Hit =
+  mongoose.models.Hit ||
+  mongoose.model(
+    "Hit",
+    new mongoose.Schema(
+      {
+        guildId: { type: String, index: true },
+        targetId: { type: String, index: true, required: true },
+        bounty: { type: Number, required: true, min: 1 },
+        createdBy: { type: String, required: true },
+        active: { type: Boolean, default: true, index: true },
+        claimedById: { type: String, default: null },
+        claimedAt: { type: Date, default: null },
+      },
+      { timestamps: true }
+    )
+  );
 
 export const data = new SlashCommandBuilder()
-  .setName("hit")
-  .setDescription("Place a bounty on another player")
-  .addUserOption(opt =>
-    opt.setName("user").setDescription("The target").setRequired(true)
-  )
-  .addIntegerOption(opt =>
-    opt.setName("amount").setDescription("Bounty amount (min 500)").setRequired(true)
+  .setName("acceptcontract")
+  .setDescription("Accept and complete a hit contract")
+  .addUserOption((opt) =>
+    opt.setName("target").setDescription("Target user").setRequired(true)
   );
 
 export async function execute(interaction) {
-  const target = interaction.options.getUser("user");
-  const amount = interaction.options.getInteger("amount");
-  const wallet = await Wallet.findOne({ userId: interaction.user.id });
+  const target = interaction.options.getUser("target", true);
 
-  if (!wallet) return interaction.reply({ content: "❌ You need a wallet first.", flags: 64 });
-
-  // Checks
-  if (target.id === interaction.user.id) {
-    return interaction.reply({ content: "❌ You can’t place a hit on yourself.", flags: 64 });
-  }
-  if (target.bot) {
-    return interaction.reply({ content: "🤖 You can’t place a hit on a bot.", flags: 64 });
-  }
-  if (amount < 500) {
-    return interaction.reply({ content: "❌ Minimum bounty is **500 coins**.", flags: 64 });
-  }
-  if (wallet.balance < amount) {
-    return interaction.reply({ content: "❌ You don’t have enough coins.", flags: 64 });
+  // Must have a wallet
+  const hunter = await Wallet.findOne({ userId: interaction.user.id });
+  if (!hunter) {
+    return interaction.reply({
+      content: "❌ You need a wallet to accept contracts.",
+      ephemeral: true,
+    });
   }
 
-  // Deduct balance
-  wallet.balance -= amount;
-  wallet.warrants = (wallet.warrants || 0) + 1; // Placing a hit is illegal!
-  await wallet.save();
+  // Atomically claim one active hit for this guild+target
+  const hit = await Hit.findOneAndUpdate(
+    { guildId: interaction.guildId, targetId: target.id, active: true },
+    { $set: { active: false, claimedById: interaction.user.id, claimedAt: new Date() } },
+    { new: true }
+  );
 
-  // Save hit
-  const hit = new Hit({ targetId: target.id, bounty: amount, createdBy: interaction.user.id });
-  await hit.save();
+  if (!hit) {
+    return interaction.reply({ content: "❌ No active contract on that user.", ephemeral: true });
+  }
 
-  // Embed
-  const embed = new EmbedBuilder()
-    .setTitle("🎯 New Hit Placed!")
-    .setColor("DarkRed")
-    .setDescription(
-      `A contract has been placed on **${target.username}**!\n` +
-      `💰 **Bounty:** ${amount} coins\n` +
-      `📌 Placed by: <@${interaction.user.id}>`
-    )
-    .setFooter({ text: "Use /acceptcontract to claim this job." });
+  // Pay bounty to hunter's cash
+  const after = await Wallet.findOneAndUpdate(
+    { userId: interaction.user.id },
+    { $inc: { cash: hit.bounty } },
+    { new: true, upsert: true }
+  );
 
-  // Reply privately & broadcast in channel
-  await interaction.reply({ content: `✅ Hit placed on <@${target.id}> for **${amount} coins**.`, flags: 64 });
-  await interaction.channel.send({ embeds: [embed] });
+  return interaction.reply(
+    `🔪 Contract completed! You earned **$${hit.bounty.toLocaleString()}** for taking out <@${target.id}>. ` +
+    `Your cash is now **$${(after.cash ?? 0).toLocaleString()}**.`
+  );
 }
