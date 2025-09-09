@@ -1,56 +1,69 @@
-import { SlashCommandBuilder, MessageFlags } from "discord.js";
-import Wallet from "../../src/database/Wallet.js";
+// commands/economy/acceptcontract.js
+import { SlashCommandBuilder } from "discord.js";
 import mongoose from "mongoose";
+import Wallet from "../../src/database/Wallet.js";
 
-// Ensure Hit model exists
-const Hit = mongoose.models.Hit || mongoose.model(
-  "Hit",
-  new mongoose.Schema({
-    targetId: String,
-    bounty: Number,
-    active: Boolean,
-  })
-);
+// Hit model with sensible defaults and guild scoping
+const Hit =
+  mongoose.models.Hit ||
+  mongoose.model(
+    "Hit",
+    new mongoose.Schema(
+      {
+        guildId: { type: String, index: true },
+        creatorId: { type: String, index: true },
+        targetId: { type: String, index: true, required: true },
+        bounty: { type: Number, required: true, min: 1 },
+        active: { type: Boolean, default: true, index: true },
+        claimedById: { type: String, default: null },
+        claimedAt: { type: Date, default: null },
+      },
+      { timestamps: true }
+    )
+  );
 
 export const data = new SlashCommandBuilder()
   .setName("acceptcontract")
   .setDescription("Accept and complete a hit contract")
-  .addUserOption(opt =>
-    opt.setName("target")
-      .setDescription("Target user")
-      .setRequired(true)
+  .addUserOption((opt) =>
+    opt.setName("target").setDescription("Target user").setRequired(true)
   );
 
 export async function execute(interaction) {
-  const target = interaction.options.getUser("target");
+  const target = interaction.options.getUser("target", true);
 
-  // Find the player’s wallet
-  const wallet = await Wallet.findOne({ userId: interaction.user.id });
-  if (!wallet) {
+  // Ensure the caller has a wallet (eco uses cash/bank fields)
+  const hunter = await Wallet.findOne({ userId: interaction.user.id });
+  if (!hunter) {
     return interaction.reply({
-      content: "❌ You need a wallet.",
-      flags: MessageFlags.Ephemeral, // replaces deprecated ephemeral:true
+      content: "❌ You need a wallet to accept contracts.",
+      ephemeral: true,
     });
   }
 
-  // Check if there’s an active contract
-  const hit = await Hit.findOne({ targetId: target.id, active: true });
+  // Atomically grab an active hit for this guild+target and mark it inactive
+  // This prevents two people from claiming the same bounty.
+  const hit = await Hit.findOneAndUpdate(
+    { guildId: interaction.guildId, targetId: target.id, active: true },
+    { $set: { active: false, claimedById: interaction.user.id, claimedAt: new Date() } },
+    { new: true }
+  );
+
   if (!hit) {
     return interaction.reply({
       content: "❌ No active contract on that user.",
-      flags: MessageFlags.Ephemeral,
+      ephemeral: true,
     });
   }
 
-  // Resolve contract
-  hit.active = false;
-  await hit.save();
-
-  // Pay bounty
-  wallet.balance += hit.bounty;
-  await wallet.save();
+  // Pay the bounty safely to eco's 'cash' field (not 'balance')
+  const after = await Wallet.findOneAndUpdate(
+    { userId: interaction.user.id },
+    { $inc: { cash: hit.bounty } },
+    { new: true, upsert: true } // upsert in case something weird happened
+  );
 
   return interaction.reply(
-    `🔪 Contract completed! You earned **${hit.bounty.toLocaleString()} coins** for taking out <@${target.id}>.`
+    `🔪 Contract completed! You earned **$${hit.bounty.toLocaleString()}** for taking out <@${target.id}>. Your cash is now **$${(after.cash ?? 0).toLocaleString()}**.`
   );
 }
