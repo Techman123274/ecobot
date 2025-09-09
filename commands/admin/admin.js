@@ -3,22 +3,37 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
-  MessageFlags,
   Colors,
 } from "discord.js";
 
+import mongoose from "mongoose";
 import Wallet from "../../src/database/Wallet.js";
 import Gang from "../../src/database/Gang.js";
 import Territory from "../../src/database/Territory.js";
 import PromoCode from "../../src/database/PromoCode.js";
-// Keeping these imports if you expand later; remove if unused to satisfy linters
-import Business from "../../src/database/Business.js";
-import Property from "../../src/database/Property.js";
+// If you don't need these yet, remove them to satisfy linters
+// import Business from "../../src/database/Business.js";
+// import Property from "../../src/database/Property.js";
 import { sendToJail, sendToHospital } from "../../utils/crimeSystem.js";
 
-const OWNER_ID = process.env.OWNER_ID || ""; // optional extra lock
+/* =========================
+   CONFIG / SAFEGUARDS
+   Adjust via env if needed
+   ========================= */
+const OWNER_ID = process.env.OWNER_ID || ""; // Optional hard lock
 
+const MAX_ABS_DELTA = Number(process.env.ADMIN_MAX_ABS_DELTA ?? 1_000_000);       // Max +/- change at once
+const MAX_SET_BALANCE = Number(process.env.ADMIN_MAX_SET_BALANCE ?? 10_000_000);  // Max absolute balance allowed
+const MAX_PROMO_VALUE = Number(process.env.ADMIN_MAX_PROMO_VALUE ?? 100_000);
+const MAX_PROMO_USES = Number(process.env.ADMIN_MAX_PROMO_USES ?? 1000);
+const MAX_PROMO_DAYS = Number(process.env.ADMIN_MAX_PROMO_DAYS ?? 60);
+const ADMIN_LOG_CHANNEL_ID = process.env.ADMIN_LOG_CHANNEL_ID || ""; // Optional audit log channel
+
+/* =========================
+   HELPERS
+   ========================= */
 function isAllowed(interaction) {
+  // Admins OR exact owner id if provided
   const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
   const isOwner = OWNER_ID && interaction.user.id === OWNER_ID;
   return Boolean(isAdmin || isOwner);
@@ -26,6 +41,33 @@ function isAllowed(interaction) {
 
 function ok(content, color = Colors.Green) {
   return new EmbedBuilder().setColor(color).setDescription(content);
+}
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function ensureSafeInt(n) {
+  if (!Number.isInteger(n) || !Number.isSafeInteger(n)) {
+    throw new Error("INVALID_AMOUNT");
+  }
+}
+
+async function logAction(interaction, action, details) {
+  if (!ADMIN_LOG_CHANNEL_ID) return;
+  try {
+    const ch = await interaction.client.channels.fetch(ADMIN_LOG_CHANNEL_ID);
+    if (!ch || !ch.isTextBased()) return;
+    const embed = new EmbedBuilder()
+      .setColor(Colors.Blurple)
+      .setTitle(`Admin: ${action}`)
+      .setDescription(details)
+      .setFooter({ text: `By ${interaction.user.tag} (${interaction.user.id})` })
+      .setTimestamp(new Date());
+    await ch.send({ embeds: [embed] });
+  } catch {
+    // swallow logging errors
+  }
 }
 
 // Wallet defaults to ensure consistent shape on upsert
@@ -40,6 +82,9 @@ const WALLET_DEFAULTS = {
   isDead: false,
 };
 
+/* =========================
+   SLASH COMMAND BUILDER
+   ========================= */
 export const data = new SlashCommandBuilder()
   .setName("admin")
   .setDescription("Admin-only actions for EcoBot.")
@@ -53,32 +98,47 @@ export const data = new SlashCommandBuilder()
         sc.setName("addcash")
           .setDescription("Add cash to a user's wallet.")
           .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("Amount to add").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`Amount to add (1..${MAX_ABS_DELTA.toLocaleString()})`)
+              .setRequired(true).setMinValue(1).setMaxValue(MAX_ABS_DELTA)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("setcash")
           .setDescription("Set a user's cash.")
           .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("New cash").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`New cash (0..${MAX_SET_BALANCE.toLocaleString()})`)
+              .setRequired(true).setMinValue(0).setMaxValue(MAX_SET_BALANCE)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("addbank")
           .setDescription("Add bank balance to a user.")
           .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("Amount to add").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`Amount to add (1..${MAX_ABS_DELTA.toLocaleString()})`)
+              .setRequired(true).setMinValue(1).setMaxValue(MAX_ABS_DELTA)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("setbank")
           .setDescription("Set a user's bank balance.")
           .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("New bank").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`New bank (0..${MAX_SET_BALANCE.toLocaleString()})`)
+              .setRequired(true).setMinValue(0).setMaxValue(MAX_SET_BALANCE)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("transfer")
           .setDescription("Transfer cash between users.")
           .addUserOption(o => o.setName("from").setDescription("From user").setRequired(true))
           .addUserOption(o => o.setName("to").setDescription("To user").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("Amount").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`Amount (1..${MAX_ABS_DELTA.toLocaleString()})`)
+              .setRequired(true).setMinValue(1).setMaxValue(MAX_ABS_DELTA)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("reset")
@@ -94,7 +154,7 @@ export const data = new SlashCommandBuilder()
         sc.setName("setwarrants")
           .setDescription("Set a user's warrants.")
           .addUserOption(o => o.setName("user").setDescription("Target").setRequired(true))
-          .addIntegerOption(o => o.setName("count").setDescription("New count").setRequired(true))
+          .addIntegerOption(o => o.setName("count").setDescription("New count").setRequired(true).setMinValue(0).setMaxValue(100))
       )
       .addSubcommand(sc =>
         sc.setName("clearwarrants")
@@ -105,7 +165,7 @@ export const data = new SlashCommandBuilder()
         sc.setName("jail")
           .setDescription("Send user to jail (minutes).")
           .addUserOption(o => o.setName("user").setDescription("Target").setRequired(true))
-          .addIntegerOption(o => o.setName("minutes").setDescription("Minutes").setRequired(true))
+          .addIntegerOption(o => o.setName("minutes").setDescription("Minutes").setRequired(true).setMinValue(1).setMaxValue(60 * 24))
       )
       .addSubcommand(sc =>
         sc.setName("free")
@@ -116,7 +176,7 @@ export const data = new SlashCommandBuilder()
         sc.setName("hospital")
           .setDescription("Send user to hospital.")
           .addUserOption(o => o.setName("user").setDescription("Target").setRequired(true))
-          .addIntegerOption(o => o.setName("minutes").setDescription("Minutes").setRequired(true))
+          .addIntegerOption(o => o.setName("minutes").setDescription("Minutes").setRequired(true).setMinValue(1).setMaxValue(60 * 24))
           .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false))
       )
       .addSubcommand(sc =>
@@ -164,13 +224,16 @@ export const data = new SlashCommandBuilder()
         sc.setName("setlevel")
           .setDescription("Set a gang's level.")
           .addStringOption(o => o.setName("gangid").setDescription("Gang ID").setRequired(true))
-          .addIntegerOption(o => o.setName("level").setDescription("New level").setRequired(true))
+          .addIntegerOption(o => o.setName("level").setDescription("New level").setRequired(true).setMinValue(1).setMaxValue(100))
       )
       .addSubcommand(sc =>
         sc.setName("treasury")
           .setDescription("Adjust gang treasury.")
           .addStringOption(o => o.setName("gangid").setDescription("Gang ID").setRequired(true))
-          .addIntegerOption(o => o.setName("amount").setDescription("Positive or negative").setRequired(true))
+          .addIntegerOption(o =>
+            o.setName("amount").setDescription(`Delta (-${MAX_ABS_DELTA.toLocaleString()}..${MAX_ABS_DELTA.toLocaleString()})`)
+              .setRequired(true).setMinValue(-MAX_ABS_DELTA).setMaxValue(MAX_ABS_DELTA)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("disband")
@@ -198,9 +261,18 @@ export const data = new SlashCommandBuilder()
         sc.setName("create")
           .setDescription("Create a promo code.")
           .addStringOption(o => o.setName("code").setDescription("PROMO123").setRequired(true))
-          .addIntegerOption(o => o.setName("value").setDescription("Value (coins)").setRequired(true))
-          .addIntegerOption(o => o.setName("maxuses").setDescription("Max uses").setRequired(true))
-          .addIntegerOption(o => o.setName("days").setDescription("Expires in N days").setRequired(false))
+          .addIntegerOption(o =>
+            o.setName("value").setDescription(`Value (1..${MAX_PROMO_VALUE.toLocaleString()})`)
+              .setRequired(true).setMinValue(1).setMaxValue(MAX_PROMO_VALUE)
+          )
+          .addIntegerOption(o =>
+            o.setName("maxuses").setDescription(`Max uses (1..${MAX_PROMO_USES})`)
+              .setRequired(true).setMinValue(1).setMaxValue(MAX_PROMO_USES)
+          )
+          .addIntegerOption(o =>
+            o.setName("days").setDescription(`Expires in N days (1..${MAX_PROMO_DAYS})`)
+              .setRequired(false).setMinValue(1).setMaxValue(MAX_PROMO_DAYS)
+          )
       )
       .addSubcommand(sc =>
         sc.setName("delete")
@@ -230,9 +302,12 @@ export const data = new SlashCommandBuilder()
       )
   );
 
+/* =========================
+   EXECUTE
+   ========================= */
 export async function execute(interaction) {
   if (!isAllowed(interaction)) {
-    return interaction.reply({ content: "❌ Admins only.", flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
   }
   const group = interaction.options.getSubcommandGroup();
   const sub = interaction.options.getSubcommand();
@@ -242,124 +317,122 @@ export async function execute(interaction) {
     if (group === "economy") {
       if (sub === "addcash") {
         const user = interaction.options.getUser("user", true);
-        const amount = interaction.options.getInteger("amount", true);
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, 1, MAX_ABS_DELTA);
 
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
-          {
-            $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS },
-            $inc: { cash: amount },
-          },
+          { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $inc: { cash: amount } },
           { upsert: true, new: true }
         );
 
-        return interaction.reply({
-          embeds: [ok(`✅ Added **$${amount}** to ${user}\nNew cash: **$${after.cash}**`)],
-          flags: MessageFlags.Ephemeral,
-        });
+        await logAction(interaction, "economy.addcash", `+${amount} to ${user.id} → cash=${after.cash}`);
+        return interaction.reply({ embeds: [ok(`✅ Added **$${amount}** to ${user}\nNew cash: **$${after.cash}**`)], ephemeral: true });
       }
 
       if (sub === "setcash") {
         const user = interaction.options.getUser("user", true);
-        const amount = Math.max(0, interaction.options.getInteger("amount", true));
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, 0, MAX_SET_BALANCE);
 
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
-          {
-            $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS },
-            $set: { cash: amount },
-          },
+          { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { cash: amount } },
           { upsert: true, new: true }
         );
 
-        return interaction.reply({
-          embeds: [ok(`✅ Cash set to **$${after.cash}** for ${user}`)],
-          flags: MessageFlags.Ephemeral,
-        });
+        await logAction(interaction, "economy.setcash", `set ${user.id} cash=${after.cash}`);
+        return interaction.reply({ embeds: [ok(`✅ Cash set to **$${after.cash}** for ${user}`)], ephemeral: true });
       }
 
       if (sub === "addbank") {
         const user = interaction.options.getUser("user", true);
-        const amount = interaction.options.getInteger("amount", true);
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, 1, MAX_ABS_DELTA);
 
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
-          {
-            $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS },
-            $inc: { bank: amount },
-          },
+          { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $inc: { bank: amount } },
           { upsert: true, new: true }
         );
 
-        return interaction.reply({
-          embeds: [ok(`✅ Added **$${amount}** bank to ${user}\nNew bank: **$${after.bank}**`)],
-          flags: MessageFlags.Ephemeral,
-        });
+        await logAction(interaction, "economy.addbank", `+${amount} to ${user.id} → bank=${after.bank}`);
+        return interaction.reply({ embeds: [ok(`✅ Added **$${amount}** bank to ${user}\nNew bank: **$${after.bank}**`)], ephemeral: true });
       }
 
       if (sub === "setbank") {
         const user = interaction.options.getUser("user", true);
-        const amount = Math.max(0, interaction.options.getInteger("amount", true));
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, 0, MAX_SET_BALANCE);
 
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
-          {
-            $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS },
-            $set: { bank: amount },
-          },
+          { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { bank: amount } },
           { upsert: true, new: true }
         );
 
-        return interaction.reply({
-          embeds: [ok(`✅ Bank set to **$${after.bank}** for ${user}`)],
-          flags: MessageFlags.Ephemeral,
-        });
+        await logAction(interaction, "economy.setbank", `set ${user.id} bank=${after.bank}`);
+        return interaction.reply({ embeds: [ok(`✅ Bank set to **$${after.bank}** for ${user}`)], ephemeral: true });
       }
 
       if (sub === "transfer") {
         const from = interaction.options.getUser("from", true);
         const to = interaction.options.getUser("to", true);
-        const amount = Math.max(1, interaction.options.getInteger("amount", true));
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, 1, MAX_ABS_DELTA);
 
-        // Check donor funds atomically
-        const donor = await Wallet.findOne({ userId: from.id });
-        if (!donor || (donor.cash ?? 0) < amount) {
-          return interaction.reply({ content: "❌ Donor has insufficient cash.", flags: MessageFlags.Ephemeral });
+        const session = await mongoose.startSession();
+        let recipientAfter;
+        try {
+          await session.withTransaction(async () => {
+            // Deduct only if donor has enough, atomically
+            const res = await Wallet.updateOne(
+              { userId: from.id, cash: { $gte: amount } },
+              { $inc: { cash: -amount }, $setOnInsert: { userId: from.id, ...WALLET_DEFAULTS } },
+              { upsert: true, session }
+            );
+            if (res.matchedCount === 0) {
+              throw new Error("INSUFFICIENT_FUNDS");
+            }
+            recipientAfter = await Wallet.findOneAndUpdate(
+              { userId: to.id },
+              { $inc: { cash: amount }, $setOnInsert: { userId: to.id, ...WALLET_DEFAULTS } },
+              { upsert: true, new: true, session }
+            );
+          });
+        } catch (e) {
+          await session.endSession();
+          if (e.message === "INSUFFICIENT_FUNDS") {
+            return interaction.reply({ content: "❌ Donor has insufficient cash.", ephemeral: true });
+          }
+          throw e;
         }
+        await session.endSession();
 
-        await Wallet.findOneAndUpdate(
-          { userId: from.id },
-          { $inc: { cash: -amount } },
-          { new: true }
-        );
-
-        const recipient = await Wallet.findOneAndUpdate(
-          { userId: to.id },
-          {
-            $setOnInsert: { userId: to.id, ...WALLET_DEFAULTS },
-            $inc: { cash: amount },
-          },
-          { upsert: true, new: true }
-        );
-
+        await logAction(interaction, "economy.transfer", `${from.id} -> ${to.id} $${amount}`);
         return interaction.reply({
-          embeds: [ok(`🔄 Transferred **$${amount}** from ${from} to ${to}.\n${to} new cash: **$${recipient.cash}**`)],
-          flags: MessageFlags.Ephemeral,
+          embeds: [ok(`🔄 Transferred **$${amount}** from ${from} to ${to}.\n${to} new cash: **$${recipientAfter.cash}**`)],
+          ephemeral: true,
         });
       }
 
       if (sub === "reset") {
         const user = interaction.options.getUser("user", true);
-
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
           { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { cash: 0, bank: 0 } },
           { upsert: true, new: true }
         );
 
+        await logAction(interaction, "economy.reset", `reset ${user.id} cash/bank`);
         return interaction.reply({
           embeds: [ok(`🧹 Reset cash & bank for ${user}.\nCash: **$${after.cash}**, Bank: **$${after.bank}**`)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
     }
@@ -368,7 +441,9 @@ export async function execute(interaction) {
     if (group === "crime") {
       if (sub === "setwarrants") {
         const user = interaction.options.getUser("user", true);
-        const count = Math.max(0, interaction.options.getInteger("count", true));
+        let count = interaction.options.getInteger("count", true);
+        ensureSafeInt(count);
+        count = clamp(count, 0, 100);
 
         const after = await Wallet.findOneAndUpdate(
           { userId: user.id },
@@ -376,9 +451,10 @@ export async function execute(interaction) {
           { upsert: true, new: true }
         );
 
+        await logAction(interaction, "crime.setwarrants", `${user.id} warrants=${after.warrants}`);
         return interaction.reply({
           embeds: [ok(`📝 Warrants for ${user}: **${after.warrants}**`, Colors.Orange)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
 
@@ -391,18 +467,23 @@ export async function execute(interaction) {
           { upsert: true, new: true }
         );
 
+        await logAction(interaction, "crime.clearwarrants", `${user.id}`);
         return interaction.reply({
           embeds: [ok(`🧹 Cleared warrants for ${user}. Now **${after.warrants}**.`, Colors.Orange)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
 
       if (sub === "jail") {
         const user = interaction.options.getUser("user", true);
-        const minutes = Math.max(1, interaction.options.getInteger("minutes", true));
-        const w = await Wallet.findOne({ userId: user.id }) || new Wallet({ userId: user.id, ...WALLET_DEFAULTS });
+        let minutes = interaction.options.getInteger("minutes", true);
+        ensureSafeInt(minutes);
+        minutes = clamp(minutes, 1, 60 * 24);
+
+        const w = (await Wallet.findOne({ userId: user.id })) || new Wallet({ userId: user.id, ...WALLET_DEFAULTS });
         const msg = await sendToJail(w, minutes); // helper saves internally
-        return interaction.reply({ embeds: [ok(`🚔 ${user} ${msg}`, Colors.Red)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "crime.jail", `${user.id} for ${minutes}m`);
+        return interaction.reply({ embeds: [ok(`🚔 ${user} ${msg}`, Colors.Red)], ephemeral: true });
       }
 
       if (sub === "free") {
@@ -410,23 +491,25 @@ export async function execute(interaction) {
 
         await Wallet.findOneAndUpdate(
           { userId: user.id },
-          {
-            $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS },
-            $set: { jailUntil: 0, hospitalUntil: 0, hospitalReason: "" },
-          },
-          { upsert: true, new: true }
+          { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { jailUntil: 0, hospitalUntil: 0, hospitalReason: "" } },
+          { upsert: true }
         );
 
-        return interaction.reply({ embeds: [ok(`🕊️ Freed ${user} (jail & hospital cleared).`)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "crime.free", `${user.id}`);
+        return interaction.reply({ embeds: [ok(`🕊️ Freed ${user} (jail & hospital cleared).`)], ephemeral: true });
       }
 
       if (sub === "hospital") {
         const user = interaction.options.getUser("user", true);
-        const minutes = Math.max(1, interaction.options.getInteger("minutes", true));
+        let minutes = interaction.options.getInteger("minutes", true);
+        ensureSafeInt(minutes);
+        minutes = clamp(minutes, 1, 60 * 24);
         const reason = interaction.options.getString("reason") || "Admin hospitalization";
-        const w = await Wallet.findOne({ userId: user.id }) || new Wallet({ userId: user.id, ...WALLET_DEFAULTS });
+
+        const w = (await Wallet.findOne({ userId: user.id })) || new Wallet({ userId: user.id, ...WALLET_DEFAULTS });
         const msg = await sendToHospital(w, minutes, reason); // helper saves internally
-        return interaction.reply({ embeds: [ok(`🏥 ${user} ${msg}`, Colors.Red)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "crime.hospital", `${user.id} for ${minutes}m (${reason})`);
+        return interaction.reply({ embeds: [ok(`🏥 ${user} ${msg}`, Colors.Red)], ephemeral: true });
       }
 
       if (sub === "revive") {
@@ -435,10 +518,11 @@ export async function execute(interaction) {
         await Wallet.findOneAndUpdate(
           { userId: user.id },
           { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { isDead: false } },
-          { upsert: true, new: true }
+          { upsert: true }
         );
 
-        return interaction.reply({ embeds: [ok(`❤️ Revived ${user}.`)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "crime.revive", `${user.id}`);
+        return interaction.reply({ embeds: [ok(`❤️ Revived ${user}.`)], ephemeral: true });
       }
     }
 
@@ -450,14 +534,16 @@ export async function execute(interaction) {
 
         if (cmd) {
           await Wallet.updateOne({ userId: user.id }, { $unset: { [`cooldowns.${cmd}`]: "" } });
-          return interaction.reply({ embeds: [ok(`⏳ Cleared \`${cmd}\` cooldown for ${user}.`)], flags: MessageFlags.Ephemeral });
+          await logAction(interaction, "cooldowns.clear", `${user.id} cmd=${cmd}`);
+          return interaction.reply({ embeds: [ok(`⏳ Cleared \`${cmd}\` cooldown for ${user}.`)], ephemeral: true });
         } else {
           await Wallet.findOneAndUpdate(
             { userId: user.id },
             { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { cooldowns: {} } },
             { upsert: true }
           );
-          return interaction.reply({ embeds: [ok(`⏳ Cleared **all** cooldowns for ${user}.`)], flags: MessageFlags.Ephemeral });
+          await logAction(interaction, "cooldowns.clearall", `${user.id}`);
+          return interaction.reply({ embeds: [ok(`⏳ Cleared **all** cooldowns for ${user}.`)], ephemeral: true });
         }
       }
     }
@@ -468,29 +554,30 @@ export async function execute(interaction) {
         const user = interaction.options.getUser("user", true);
         const existing = await Wallet.findOne({ userId: user.id });
         if (existing) {
-          return interaction.reply({ embeds: [ok(`ℹ️ Wallet already exists for ${user}.`, Colors.Blurple)], flags: MessageFlags.Ephemeral });
+          return interaction.reply({ embeds: [ok(`ℹ️ Wallet already exists for ${user}.`, Colors.Blurple)], ephemeral: true });
         }
 
         await Wallet.create({ userId: user.id, ...WALLET_DEFAULTS });
-        return interaction.reply({ embeds: [ok(`✅ Created wallet for ${user}.`)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "user.createwallet", `${user.id}`);
+        return interaction.reply({ embeds: [ok(`✅ Created wallet for ${user}.`)], ephemeral: true });
       }
 
       if (sub === "deletewallet") {
         const user = interaction.options.getUser("user", true);
         await Wallet.deleteOne({ userId: user.id });
-        return interaction.reply({ embeds: [ok(`🗑️ Deleted wallet for ${user}.`, Colors.Red)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "user.deletewallet", `${user.id}`);
+        return interaction.reply({ embeds: [ok(`🗑️ Deleted wallet for ${user}.`, Colors.Red)], ephemeral: true });
       }
 
       if (sub === "resetwallet") {
         const user = interaction.options.getUser("user", true);
-
         await Wallet.findOneAndUpdate(
           { userId: user.id },
           { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $set: { ...WALLET_DEFAULTS } },
           { upsert: true }
         );
-
-        return interaction.reply({ embeds: [ok(`🔄 Reset wallet for ${user}.`)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "user.resetwallet", `${user.id}`);
+        return interaction.reply({ embeds: [ok(`🔄 Reset wallet for ${user}.`)], ephemeral: true });
       }
     }
 
@@ -498,22 +585,30 @@ export async function execute(interaction) {
     if (group === "gang") {
       if (sub === "setlevel") {
         const gangId = interaction.options.getString("gangid", true);
-        const level = Math.max(1, interaction.options.getInteger("level", true));
+        let level = interaction.options.getInteger("level", true);
+        ensureSafeInt(level);
+        level = clamp(level, 1, 100);
+
         await Gang.updateOne({ gangId }, { $set: { level } }, { upsert: true });
-        return interaction.reply({ embeds: [ok(`🛠️ Gang \`${gangId}\` level set to **${level}**.`)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "gang.setlevel", `${gangId} level=${level}`);
+        return interaction.reply({ embeds: [ok(`🛠️ Gang \`${gangId}\` level set to **${level}**.`)], ephemeral: true });
       }
 
       if (sub === "treasury") {
         const gangId = interaction.options.getString("gangid", true);
-        const amount = interaction.options.getInteger("amount", true);
+        let amount = interaction.options.getInteger("amount", true);
+        ensureSafeInt(amount);
+        amount = clamp(amount, -MAX_ABS_DELTA, MAX_ABS_DELTA);
+
         const after = await Gang.findOneAndUpdate(
           { gangId },
           { $setOnInsert: { gangId, treasury: 0, level: 1, active: true }, $inc: { treasury: amount } },
           { upsert: true, new: true }
         );
+        await logAction(interaction, "gang.treasury", `${gangId} ${amount >= 0 ? "+" : ""}${amount} → ${after.treasury ?? 0}`);
         return interaction.reply({
           embeds: [ok(`💰 Gang \`${gangId}\` treasury adjusted by **$${amount}**.\nNew: **$${after.treasury ?? 0}**`)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
 
@@ -524,7 +619,8 @@ export async function execute(interaction) {
           { $setOnInsert: { gangId, treasury: 0, level: 1 }, $set: { active: false } },
           { upsert: true }
         );
-        return interaction.reply({ embeds: [ok(`❌ Disbanded gang \`${gangId}\`.`, Colors.Red)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "gang.disband", `${gangId}`);
+        return interaction.reply({ embeds: [ok(`❌ Disbanded gang \`${gangId}\`.`, Colors.Red)], ephemeral: true });
       }
     }
 
@@ -540,10 +636,10 @@ export async function execute(interaction) {
           { $setOnInsert: { guildId, name }, $set: { ownerGangId: gangId } },
           { upsert: true, new: true }
         );
-
+        await logAction(interaction, "territory.transfer", `${name} -> ${gangId} (guild ${guildId})`);
         return interaction.reply({
           embeds: [ok(`🗺️ Territory **${after.name}** now owned by gang \`${gangId}\`.`)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
     }
@@ -551,23 +647,32 @@ export async function execute(interaction) {
     // ===== promo =====
     if (group === "promo") {
       if (sub === "create") {
-        const code = interaction.options.getString("code", true).toUpperCase();
-        const value = interaction.options.getInteger("value", true);
-        const maxUses = Math.max(1, interaction.options.getInteger("maxuses", true));
-        const days = interaction.options.getInteger("days") ?? 14;
+        const code = interaction.options.getString("code", true).toUpperCase().replace(/\s+/g, "");
+        let value = interaction.options.getInteger("value", true);
+        let maxUses = interaction.options.getInteger("maxuses", true);
+        let days = interaction.options.getInteger("days") ?? 14;
+
+        ensureSafeInt(value); ensureSafeInt(maxUses); ensureSafeInt(days);
+        value = clamp(value, 1, MAX_PROMO_VALUE);
+        maxUses = clamp(maxUses, 1, MAX_PROMO_USES);
+        days = clamp(days, 1, MAX_PROMO_DAYS);
+
         const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
 
         await PromoCode.create({ code, value, maxUses, usedCount: 0, expiresAt, active: true });
+
+        await logAction(interaction, "promo.create", `${code} value=${value} uses=${maxUses} days=${days}`);
         return interaction.reply({
           embeds: [ok(`🎁 Promo **${code}** created: value **$${value}**, maxUses **${maxUses}**, expires **${expiresAt.toDateString()}**`)],
-          flags: MessageFlags.Ephemeral,
+          ephemeral: true,
         });
       }
 
       if (sub === "delete") {
-        const code = interaction.options.getString("code", true).toUpperCase();
+        const code = interaction.options.getString("code", true).toUpperCase().trim();
         await PromoCode.deleteOne({ code });
-        return interaction.reply({ embeds: [ok(`🗑️ Promo **${code}** deleted.`, Colors.Red)], flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "promo.delete", `${code}`);
+        return interaction.reply({ embeds: [ok(`🗑️ Promo **${code}** deleted.`, Colors.Red)], ephemeral: true });
       }
     }
 
@@ -578,6 +683,10 @@ export async function execute(interaction) {
         const title = interaction.options.getString("title", true);
         const message = interaction.options.getString("message", true);
 
+        if (!channel?.isTextBased?.()) {
+          return interaction.reply({ content: "❌ That channel isn't text-based.", ephemeral: true });
+        }
+
         const embed = new EmbedBuilder()
           .setColor(Colors.Blurple)
           .setTitle(title)
@@ -586,31 +695,32 @@ export async function execute(interaction) {
           .setTimestamp(new Date());
 
         await channel.send({ embeds: [embed] });
-        return interaction.reply({ content: "📣 Announcement sent.", flags: MessageFlags.Ephemeral });
+        await logAction(interaction, "util.announce", `#${channel.id} "${title}"`);
+        return interaction.reply({ content: "📣 Announcement sent.", ephemeral: true });
       }
 
       if (sub === "ping") {
-        return interaction.reply({ embeds: [ok("🏓 Admin panel online.")], flags: MessageFlags.Ephemeral });
+        return interaction.reply({ embeds: [ok("🏓 Admin panel online.")], ephemeral: true });
       }
 
       if (sub === "debugwallet") {
         const user = interaction.options.getUser("user", true);
         const doc = await Wallet.findOne({ userId: user.id }).lean();
+        const content = "```json\n" + JSON.stringify(doc ?? { note: "no wallet" }, null, 2) + "\n```";
         return interaction.reply({
-          content: "```json\n" + JSON.stringify(doc ?? { note: "no wallet" }, null, 2) + "\n```",
-          flags: MessageFlags.Ephemeral,
+          content: content.slice(0, 1995),
+          ephemeral: true,
         });
       }
     }
 
-    // fallback (shouldn’t hit)
-    return interaction.reply({ content: "Unknown admin action.", flags: MessageFlags.Ephemeral });
-
+    // fallback
+    return interaction.reply({ content: "Unknown admin action.", ephemeral: true });
   } catch (err) {
     console.error("[/admin] error:", err);
     return interaction.reply({
       content: "❌ Something went wrong executing that admin action.",
-      flags: MessageFlags.Ephemeral,
+      ephemeral: true,
     });
   }
 }
