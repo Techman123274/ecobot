@@ -1,7 +1,7 @@
-import { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+// commands/gambling/crash.js
+import { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from "discord.js";
 import Wallet from "../../src/database/Wallet.js";
 
-// keep last 5 crash multipliers in memory
 const crashHistory = [];
 
 export const data = new SlashCommandBuilder()
@@ -13,34 +13,45 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(interaction) {
   const bet = interaction.options.getInteger("amount");
-  const wallet = await Wallet.findOne({ userId: interaction.user.id });
+  const userId = interaction.user.id;
 
-  if (!wallet) return interaction.reply({ content: "❌ You need a wallet. Use `/create` first!", ephemeral: true });
-  if (bet <= 0 || wallet.balance < bet) return interaction.reply({ content: "❌ Invalid bet amount.", ephemeral: true });
+  const wallet = await Wallet.findOne({ userId });
+  if (!wallet) return interaction.reply({ content: "❌ You need a wallet. Use `/create` first!", flags: MessageFlags.Ephemeral });
 
-  // Deduct bet upfront
-  wallet.balance -= bet;
-  await wallet.save();
+  // validate funds against CASH, not balance
+  const cash = wallet.cash ?? 0;
+  if (!Number.isFinite(bet) || bet <= 0) {
+    return interaction.reply({ content: "❌ Invalid bet amount.", flags: MessageFlags.Ephemeral });
+  }
+  if (cash < bet) {
+    return interaction.reply({ content: "❌ You don’t have enough cash for that bet.", flags: MessageFlags.Ephemeral });
+  }
 
-  // Crash point (biased toward early, but sometimes big)
-  const crashPoint = (Math.pow(Math.random(), 2.5) * 80 + 1).toFixed(2);
+  // deduct bet up front (atomic)
+  await Wallet.updateOne({ userId }, { $inc: { cash: -bet } });
+
+  // pick crash point (skewed early, sometimes big)
+  const crashPoint = Number((Math.pow(Math.random(), 2.5) * 80 + 1).toFixed(2));
+
   let multiplier = 1.0;
   let cashedOut = false;
   let winnings = 0;
+  let roundOver = false;
 
-  // UI
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("cashout")
-      .setLabel("💸 Cash Out")
-      .setStyle(ButtonStyle.Success)
-  );
+  const cashBtn = new ButtonBuilder()
+    .setCustomId("cashout")
+    .setLabel("💸 Cash Out")
+    .setStyle(ButtonStyle.Success);
+
+  const row = new ActionRowBuilder().addComponents(cashBtn);
 
   const embed = new EmbedBuilder()
-    .setTitle("📈 Crash Game")
+    .setTitle("📈 Crash")
     .setColor("Blue")
     .setDescription(
-      `🎮 Player: <@${interaction.user.id}>\n💰 Bet: **${bet} coins**\n\nMultiplier: **${multiplier.toFixed(2)}x**`
+      `🎮 Player: <@${userId}>\n` +
+      `💰 Bet: **${bet}**\n\n` +
+      `Multiplier: **${multiplier.toFixed(2)}x**`
     )
     .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" })
     .setFooter({ text: "Cash out before it crashes!" });
@@ -48,87 +59,113 @@ export async function execute(interaction) {
   await interaction.reply({ embeds: [embed], components: [row] });
   const message = await interaction.fetchReply();
 
+  // Keep the collector alive long enough; we will stop it manually at round end
   const collector = message.createMessageComponentCollector({
-    filter: (i) => i.user.id === interaction.user.id,
-    time: 30000
+    filter: (i) => i.user.id === userId && i.customId === "cashout",
+    time: 120_000, // 2 minutes max safeguard
   });
 
-  // growth loop
-  const interval = setInterval(async () => {
-    multiplier *= 1.05 + Math.random() * 0.02;
+  const stopRound = async (reason) => {
+    if (roundOver) return;
+    roundOver = true;
+    clearInterval(tickTimer);
+    collector.stop(reason);
 
-    // Crash check
+    // disable button
+    const disabledRow = new ActionRowBuilder().addComponents(ButtonBuilder.from(cashBtn).setDisabled(true));
+
+    if (!cashedOut) {
+      // Player lost
+      const lost = new EmbedBuilder()
+        .setTitle("💥 CRASHED!")
+        .setColor("Red")
+        .setDescription(
+          `🎮 Player: <@${userId}>\n` +
+          `💰 Bet: **${bet}**\n\n` +
+          `Multiplier crashed at **${crashPoint.toFixed(2)}x**!\n` +
+          `❌ Lost all coins.`
+        )
+        .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
+      await interaction.editReply({ embeds: [lost], components: [disabledRow] });
+    } else {
+      const ended = new EmbedBuilder()
+        .setTitle("💥 Round Ended")
+        .setColor("Orange")
+        .setDescription(
+          `🎮 Player: <@${userId}>\n` +
+          `💰 Bet: **${bet}**\n\n` +
+          `✅ Cashed Out at **${multiplier.toFixed(2)}x**\n` +
+          `💸 Winnings: **${winnings}**\n\n` +
+          `💥 Crash hit at **${crashPoint.toFixed(2)}x**`
+        )
+        .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
+      await interaction.editReply({ embeds: [ended], components: [disabledRow] });
+    }
+  };
+
+  // growth loop — slightly faster so 3x doesn’t align with collector timeout
+  const tickTimer = setInterval(async () => {
+    if (roundOver) return;
+
+    multiplier *= 1.035 + Math.random() * 0.02; // ~3.5%–5.5% per tick
+    // check crash
     if (multiplier >= crashPoint) {
-      clearInterval(interval);
-      collector.stop("crash");
+      await stopRound("crash");
+      return;
+    }
 
-      // If player didn’t cash out → lose
-      if (!cashedOut) {
-        const lostEmbed = new EmbedBuilder()
-          .setTitle("💥 CRASHED!")
-          .setColor("Red")
-          .setDescription(
-            `🎮 Player: <@${interaction.user.id}>\n💰 Bet: **${bet} coins**\n\nMultiplier crashed at **${crashPoint}x**!\n❌ Lost all coins.`
-          )
-          .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
-
-        await interaction.editReply({ embeds: [lostEmbed], components: [] });
-      } else {
-        // Player cashed out → just show final crash
-        const finalEmbed = new EmbedBuilder()
-          .setTitle("💥 Round Ended")
-          .setColor("Orange")
-          .setDescription(
-            `🎮 Player: <@${interaction.user.id}>\n💰 Bet: **${bet} coins**\n\n✅ Cashed Out at **${multiplier.toFixed(
-              2
-            )}x**\n💸 Winnings: **${winnings} coins**\n\n💥 Crash hit at **${crashPoint}x**`
-          )
-          .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
-
-        await interaction.editReply({ embeds: [finalEmbed], components: [] });
-      }
-    } else if (!cashedOut) {
-      // live updating embed until crash
-      const updateEmbed = new EmbedBuilder()
-        .setTitle("📈 Crash Game")
+    // live UI update only if not cashed
+    if (!cashedOut) {
+      const live = new EmbedBuilder()
+        .setTitle("📈 Crash")
         .setColor("Blue")
         .setDescription(
-          `🎮 Player: <@${interaction.user.id}>\n💰 Bet: **${bet} coins**\n\nMultiplier: **${multiplier.toFixed(
-            2
-          )}x**`
+          `🎮 Player: <@${userId}>\n` +
+          `💰 Bet: **${bet}**\n\n` +
+          `Multiplier: **${multiplier.toFixed(2)}x**`
         )
         .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
 
-      await interaction.editReply({ embeds: [updateEmbed], components: [row] });
+      await interaction.editReply({ embeds: [live], components: [row] });
     }
-  }, 1200);
+  }, 1000); // 1s ticks
 
-  // Cash out handler
   collector.on("collect", async (i) => {
-    if (i.customId === "cashout" && !cashedOut) {
-      cashedOut = true;
-      winnings = Math.floor(bet * multiplier);
-      wallet.balance += winnings;
-      await wallet.save();
+    if (roundOver || cashedOut) return;
+    cashedOut = true;
 
-      const cashoutEmbed = new EmbedBuilder()
-        .setTitle("✅ Cashed Out!")
-        .setColor("Green")
-        .setDescription(
-          `🎮 Player: <@${interaction.user.id}>\n💰 Bet: **${bet} coins**\n\nCashed out at **${multiplier.toFixed(
-            2
-          )}x**\n💸 Winnings: **${winnings} coins**`
-        )
-        .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
+    winnings = Math.max(0, Math.floor(bet * multiplier));
+    // pay winnings (atomic)
+    await Wallet.updateOne({ userId }, { $inc: { cash: winnings } });
 
-      await i.update({ embeds: [cashoutEmbed], components: [] });
+    // acknowledge & show immediate cashout
+    const cashed = new EmbedBuilder()
+      .setTitle("✅ Cashed Out!")
+      .setColor("Green")
+      .setDescription(
+        `🎮 Player: <@${userId}>\n` +
+        `💰 Bet: **${bet}**\n\n` +
+        `Cashed out at **${multiplier.toFixed(2)}x**\n` +
+        `💸 Winnings: **${winnings}**`
+      )
+      .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
+
+    await i.update({ embeds: [cashed], components: [] });
+
+    // Let the round continue until it actually crashes, then show final summary.
+    // If you prefer to end instantly after cashout, call stopRound("cashed") here.
+  });
+
+  collector.on("end", async (_collected, reason) => {
+    // If time ran out but round still not over, end gracefully
+    if (!roundOver && reason === "time") {
+      await stopRound("timeout");
     }
   });
 }
 
-// Helper to update crash history
-function updateHistory(multiplier) {
-  crashHistory.unshift(multiplier + "x");
+function updateHistory(mult) {
+  crashHistory.unshift(`${Number(mult).toFixed(2)}x`);
   if (crashHistory.length > 5) crashHistory.pop();
   return crashHistory.join(" • ");
 }
