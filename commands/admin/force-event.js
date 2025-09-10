@@ -1,7 +1,9 @@
 import { SlashCommandBuilder, EmbedBuilder } from "discord.js";
-import config from "../../config.json" assert { type: "json" };
 import Wallet from "../../src/database/Wallet.js";
 import Gang from "../../src/database/Gang.js";
+
+// Put your Discord user IDs here
+const devs = ["1111829802891092068"];
 
 export const data = new SlashCommandBuilder()
   .setName("force-event")
@@ -18,7 +20,7 @@ export const data = new SlashCommandBuilder()
   );
 
 export async function execute(interaction) {
-  if (!config.devs.includes(interaction.user.id)) {
+  if (!devs.includes(interaction.user.id)) {
     return interaction.reply({ content: "❌ Devs only.", flags: 64 });
   }
 
