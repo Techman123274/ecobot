@@ -92,15 +92,55 @@ function pushRecent(msg) {
   if (metrics.recent.length > 50) metrics.recent.pop();
 }
 
+// make metrics + logger available to event files too (optional)
+client.dashboard = { metrics, pushRecent };
+
+// baseline lifecycle logs
 client.on("ready", () => pushRecent(`Bot ready as ${client.user?.tag}`));
 client.on("guildCreate", (g) => pushRecent(`Added to guild: ${g.name}`));
 client.on("guildDelete", (g) => pushRecent(`Removed from guild: ${g.name}`));
-client.on("interactionCreate", (i) => {
-  if (!i.isChatInputCommand()) return;
+
+// Record slash/context commands with user + guild, and update counters
+client.on("interactionCreate", async (i) => {
+  const isSlash = typeof i.isChatInputCommand === "function" && i.isChatInputCommand();
+  const isCtx   = typeof i.isContextMenuCommand === "function" && i.isContextMenuCommand();
+  if (!isSlash && !isCtx) return;
+
+  // Build labels
+  const userTag =
+    i.user?.discriminator && i.user.discriminator !== "0"
+      ? `${i.user.username}#${i.user.discriminator}`
+      : `@${i.user?.username || "unknown"}`;
+
+  let cmd = isSlash ? `/${i.commandName}` : i.commandName;
+  try {
+    const sub = i.options?.getSubcommand?.(false);
+    if (sub) cmd += ` ${sub}`;
+  } catch { /* no subcommand */ }
+
+  const where = i.guild ? ` in ${i.guild.name}` : "";
+  pushRecent(`Command ${cmd} by ${userTag}${where}`);
+
+  // Counters
   metrics.commandsToday++;
   metrics.activeUsersToday.add(i.user.id);
   if (i.guildId) {
     metrics.perGuildUses.set(i.guildId, (metrics.perGuildUses.get(i.guildId) ?? 0) + 1);
+  }
+
+  // Execute command if you want to handle it here (optional)
+  const command = client.commands.get(i.commandName);
+  if (!command) return;
+  try {
+    await command.execute(i);
+  } catch (err) {
+    console.error(err);
+    const content = "❌ There was an error executing this command.";
+    if (i.deferred || i.replied) {
+      try { await i.followUp({ content, ephemeral: true }); } catch {}
+    } else {
+      try { await i.reply({ content, ephemeral: true }); } catch {}
+    }
   }
 });
 

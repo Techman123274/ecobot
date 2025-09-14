@@ -1,12 +1,13 @@
 // events/interactionCreate.js
 export default async (client, interaction) => {
-  // Only handle slash commands (modern check)
-  if (!interaction.isChatInputCommand()) return;
+  // Handle slash & context menu commands
+  const isSlash = typeof interaction.isChatInputCommand === "function" && interaction.isChatInputCommand();
+  const isCtx   = typeof interaction.isContextMenuCommand === "function" && interaction.isContextMenuCommand();
+  if (!isSlash && !isCtx) return;
 
-  const command = client.commands.get(interaction.commandName);
-  if (!command) return;
+  const commandName = interaction.commandName;
 
-  // ---- record the command + user for the dashboard
+  // ---- record activity + counters for the dashboard
   try {
     const dash = client.dashboard; // { metrics, pushRecent }
     if (dash?.metrics && dash?.pushRecent) {
@@ -22,29 +23,28 @@ export default async (client, interaction) => {
         );
       }
 
-      // pretty user label (handles new username system)
+      // pretty user label (handles discriminator "0")
       const userTag =
-        interaction.user.discriminator && interaction.user.discriminator !== "0"
+        interaction.user?.discriminator && interaction.user.discriminator !== "0"
           ? `${interaction.user.username}#${interaction.user.discriminator}`
-          : `@${interaction.user.username}`;
+          : `@${interaction.user?.username || "unknown"}`;
 
       // include subcommand if present
-      let cmd = `/${interaction.commandName}`;
+      let cmd = `/${commandName}`;
       try {
         const sub = interaction.options?.getSubcommand?.(false);
         if (sub) cmd += ` ${sub}`;
-      } catch (_) {
-        /* no subcommand — ignore */
-      }
+      } catch { /* no subcommand */ }
 
       const where = interaction.guild ? ` in ${interaction.guild.name}` : "";
       pushRecent(`Command ${cmd} by ${userTag}${where}`);
     }
-  } catch {
-    // metrics are best-effort; never block command execution
-  }
+  } catch {/* never block command handling */ }
 
   // ---- run the actual command
+  const command = client.commands.get(commandName);
+  if (!command) return;
+
   try {
     await command.execute(interaction);
   } catch (error) {
