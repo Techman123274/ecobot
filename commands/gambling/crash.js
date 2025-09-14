@@ -8,27 +8,8 @@ import {
 } from "discord.js";
 import Wallet from "../../src/database/Wallet.js";
 
+const CURRENCY_FIELD = "balance"; // spend & pay from wallet.balance
 const crashHistory = [];
-
-// Prefer xcash, but fall back if your model uses another key
-const CURRENCY_CANDIDATES = [
-  "xcash",
-  "xCash",
-  "cash",
-  "balances.xcash",
-  "balances.cash",
-];
-
-const get = (obj, path) =>
-  path.split(".").reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
-
-const pickCurrencyField = (walletDoc) => {
-  for (const p of CURRENCY_CANDIDATES) {
-    const v = get(walletDoc, p);
-    if (typeof v === "number") return p;
-  }
-  return "xcash"; // final fallback
-};
 
 export const data = new SlashCommandBuilder()
   .setName("crash")
@@ -42,37 +23,36 @@ export async function execute(interaction) {
   const userId = interaction.user.id;
 
   const wallet = await Wallet.findOne({ userId }).lean();
-  if (!wallet)
+  if (!wallet) {
     return interaction.reply({
       content: "❌ You need a wallet. Use `/create` first!",
       ephemeral: true,
     });
+  }
 
-  // ✅ use the right currency field (xcash preferred)
-  const currencyField = pickCurrencyField(wallet);
-  const current = Number(get(wallet, currencyField) ?? 0);
+  const current = Number(wallet[CURRENCY_FIELD] ?? 0);
 
   if (!Number.isFinite(bet) || bet <= 0) {
     return interaction.reply({ content: "❌ Invalid bet amount.", ephemeral: true });
   }
   if (current < bet) {
-    const label = currencyField.replace(/^balances\./, "");
     return interaction.reply({
-      content: `❌ You don’t have enough **${label}** for that bet.`,
+      content: `❌ You don’t have enough **${CURRENCY_FIELD}** for that bet.`,
       ephemeral: true,
     });
   }
 
-  // deduct bet up front (atomic) from the resolved field (usually xcash)
-  await Wallet.updateOne({ userId }, { $inc: { [currencyField]: -bet } });
+  // 1) Deduct bet upfront (atomic)
+  await Wallet.updateOne({ userId }, { $inc: { [CURRENCY_FIELD]: -bet } });
 
-  // pick crash point (skew early, sometimes big)
+  // 2) Simulate crash round
   const crashPoint = Number((Math.pow(Math.random(), 2.5) * 80 + 1).toFixed(2));
 
   let multiplier = 1.0;
   let cashedOut = false;
   let winnings = 0;
   let roundOver = false;
+  let statsRecorded = false; // ensure we only write stats once
 
   const cashBtn = new ButtonBuilder()
     .setCustomId("cashout")
@@ -100,11 +80,41 @@ export async function execute(interaction) {
     time: 120_000,
   });
 
+  // Helper to write stats exactly once at end of round
+  async function recordStats() {
+    if (statsRecorded) return;
+    statsRecorded = true;
+
+    const inc = { totalBets: 1, totalWagered: bet };
+    const set = { lastGame: "crash" };
+    const max = {};
+
+    if (cashedOut) {
+      const profit = Math.max(0, winnings - bet);
+      inc.totalWon = profit;
+      max.biggestWin = profit;
+    } else {
+      inc.totalLost = bet;
+      max.biggestLoss = bet;
+    }
+
+    await Wallet.updateOne(
+      { userId },
+      {
+        $inc: inc,
+        $set: set,
+        ...(Object.keys(max).length ? { $max: max } : {}),
+      }
+    );
+  }
+
   const stopRound = async (reason) => {
     if (roundOver) return;
     roundOver = true;
     clearInterval(tickTimer);
     collector.stop(reason);
+
+    await recordStats();
 
     const disabledRow = new ActionRowBuilder().addComponents(
       ButtonBuilder.from(cashBtn).setDisabled(true)
@@ -118,9 +128,10 @@ export async function execute(interaction) {
           `🎮 Player: <@${userId}>\n` +
             `💰 Bet: **${bet}**\n\n` +
             `Multiplier crashed at **${crashPoint.toFixed(2)}x**!\n` +
-            `❌ Lost all coins.`
+            `❌ Lost your bet.`
         )
         .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
+
       await interaction.editReply({ embeds: [lost], components: [disabledRow] });
     } else {
       const ended = new EmbedBuilder()
@@ -134,14 +145,18 @@ export async function execute(interaction) {
             `💥 Crash hit at **${crashPoint.toFixed(2)}x**`
         )
         .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
-      await interaction.editReply({ embeds: [ended], components: [disabledRow] });
+
+      // keep components removed if we already removed them on cashout
+      await interaction.editReply({ embeds: [ended], components: [] });
     }
   };
 
+  // Multiplier growth loop
   const tickTimer = setInterval(async () => {
     if (roundOver) return;
 
-    multiplier *= 1.035 + Math.random() * 0.02;
+    multiplier *= 1.035 + Math.random() * 0.02; // ~3.5%–5.5% per second
+
     if (multiplier >= crashPoint) {
       await stopRound("crash");
       return;
@@ -167,7 +182,9 @@ export async function execute(interaction) {
     cashedOut = true;
 
     winnings = Math.max(0, Math.floor(bet * multiplier));
-    await Wallet.updateOne({ userId }, { $inc: { [currencyField]: winnings } });
+
+    // 3) Pay winnings immediately (atomic)
+    await Wallet.updateOne({ userId }, { $inc: { [CURRENCY_FIELD]: winnings } });
 
     const cashed = new EmbedBuilder()
       .setTitle("✅ Cashed Out!")
@@ -180,13 +197,15 @@ export async function execute(interaction) {
       )
       .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
 
+    // remove button immediately after cashout
     await i.update({ embeds: [cashed], components: [] });
-    // leave round running until it actually crashes; summary shown in stopRound()
+    // final summary comes when round ends (stopRound)
   });
 
   collector.on("end", async (_collected, reason) => {
-    if (!roundOver && reason === "time") {
-      await stopRound("timeout");
+    if (!roundOver) {
+      // If collector timed out but round is still running, end gracefully
+      await stopRound(reason || "timeout");
     }
   });
 }
