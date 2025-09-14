@@ -1,13 +1,39 @@
 // commands/gambling/crash.js
-import { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from "discord.js";
+import {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from "discord.js";
 import Wallet from "../../src/database/Wallet.js";
 
 const crashHistory = [];
 
+// Prefer xcash, but fall back if your model uses another key
+const CURRENCY_CANDIDATES = [
+  "xcash",
+  "xCash",
+  "cash",
+  "balances.xcash",
+  "balances.cash",
+];
+
+const get = (obj, path) =>
+  path.split(".").reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), obj);
+
+const pickCurrencyField = (walletDoc) => {
+  for (const p of CURRENCY_CANDIDATES) {
+    const v = get(walletDoc, p);
+    if (typeof v === "number") return p;
+  }
+  return "xcash"; // final fallback
+};
+
 export const data = new SlashCommandBuilder()
   .setName("crash")
   .setDescription("Bet on a multiplier and cash out before it crashes!")
-  .addIntegerOption(opt =>
+  .addIntegerOption((opt) =>
     opt.setName("amount").setDescription("Amount to bet").setRequired(true)
   );
 
@@ -15,22 +41,32 @@ export async function execute(interaction) {
   const bet = interaction.options.getInteger("amount");
   const userId = interaction.user.id;
 
-  const wallet = await Wallet.findOne({ userId });
-  if (!wallet) return interaction.reply({ content: "❌ You need a wallet. Use `/create` first!", flags: MessageFlags.Ephemeral });
+  const wallet = await Wallet.findOne({ userId }).lean();
+  if (!wallet)
+    return interaction.reply({
+      content: "❌ You need a wallet. Use `/create` first!",
+      ephemeral: true,
+    });
 
-  // validate funds against CASH, not balance
-  const cash = wallet.cash ?? 0;
+  // ✅ use the right currency field (xcash preferred)
+  const currencyField = pickCurrencyField(wallet);
+  const current = Number(get(wallet, currencyField) ?? 0);
+
   if (!Number.isFinite(bet) || bet <= 0) {
-    return interaction.reply({ content: "❌ Invalid bet amount.", flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: "❌ Invalid bet amount.", ephemeral: true });
   }
-  if (cash < bet) {
-    return interaction.reply({ content: "❌ You don’t have enough cash for that bet.", flags: MessageFlags.Ephemeral });
+  if (current < bet) {
+    const label = currencyField.replace(/^balances\./, "");
+    return interaction.reply({
+      content: `❌ You don’t have enough **${label}** for that bet.`,
+      ephemeral: true,
+    });
   }
 
-  // deduct bet up front (atomic)
-  await Wallet.updateOne({ userId }, { $inc: { cash: -bet } });
+  // deduct bet up front (atomic) from the resolved field (usually xcash)
+  await Wallet.updateOne({ userId }, { $inc: { [currencyField]: -bet } });
 
-  // pick crash point (skewed early, sometimes big)
+  // pick crash point (skew early, sometimes big)
   const crashPoint = Number((Math.pow(Math.random(), 2.5) * 80 + 1).toFixed(2));
 
   let multiplier = 1.0;
@@ -50,8 +86,8 @@ export async function execute(interaction) {
     .setColor("Blue")
     .setDescription(
       `🎮 Player: <@${userId}>\n` +
-      `💰 Bet: **${bet}**\n\n` +
-      `Multiplier: **${multiplier.toFixed(2)}x**`
+        `💰 Bet: **${bet}**\n\n` +
+        `Multiplier: **${multiplier.toFixed(2)}x**`
     )
     .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" })
     .setFooter({ text: "Cash out before it crashes!" });
@@ -59,10 +95,9 @@ export async function execute(interaction) {
   await interaction.reply({ embeds: [embed], components: [row] });
   const message = await interaction.fetchReply();
 
-  // Keep the collector alive long enough; we will stop it manually at round end
   const collector = message.createMessageComponentCollector({
     filter: (i) => i.user.id === userId && i.customId === "cashout",
-    time: 120_000, // 2 minutes max safeguard
+    time: 120_000,
   });
 
   const stopRound = async (reason) => {
@@ -71,19 +106,19 @@ export async function execute(interaction) {
     clearInterval(tickTimer);
     collector.stop(reason);
 
-    // disable button
-    const disabledRow = new ActionRowBuilder().addComponents(ButtonBuilder.from(cashBtn).setDisabled(true));
+    const disabledRow = new ActionRowBuilder().addComponents(
+      ButtonBuilder.from(cashBtn).setDisabled(true)
+    );
 
     if (!cashedOut) {
-      // Player lost
       const lost = new EmbedBuilder()
         .setTitle("💥 CRASHED!")
         .setColor("Red")
         .setDescription(
           `🎮 Player: <@${userId}>\n` +
-          `💰 Bet: **${bet}**\n\n` +
-          `Multiplier crashed at **${crashPoint.toFixed(2)}x**!\n` +
-          `❌ Lost all coins.`
+            `💰 Bet: **${bet}**\n\n` +
+            `Multiplier crashed at **${crashPoint.toFixed(2)}x**!\n` +
+            `❌ Lost all coins.`
         )
         .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
       await interaction.editReply({ embeds: [lost], components: [disabledRow] });
@@ -93,71 +128,63 @@ export async function execute(interaction) {
         .setColor("Orange")
         .setDescription(
           `🎮 Player: <@${userId}>\n` +
-          `💰 Bet: **${bet}**\n\n` +
-          `✅ Cashed Out at **${multiplier.toFixed(2)}x**\n` +
-          `💸 Winnings: **${winnings}**\n\n` +
-          `💥 Crash hit at **${crashPoint.toFixed(2)}x**`
+            `💰 Bet: **${bet}**\n\n` +
+            `✅ Cashed Out at **${multiplier.toFixed(2)}x**\n` +
+            `💸 Winnings: **${winnings}**\n\n` +
+            `💥 Crash hit at **${crashPoint.toFixed(2)}x**`
         )
         .addFields({ name: "Recent Crashes", value: updateHistory(crashPoint) });
       await interaction.editReply({ embeds: [ended], components: [disabledRow] });
     }
   };
 
-  // growth loop — slightly faster so 3x doesn’t align with collector timeout
   const tickTimer = setInterval(async () => {
     if (roundOver) return;
 
-    multiplier *= 1.035 + Math.random() * 0.02; // ~3.5%–5.5% per tick
-    // check crash
+    multiplier *= 1.035 + Math.random() * 0.02;
     if (multiplier >= crashPoint) {
       await stopRound("crash");
       return;
     }
 
-    // live UI update only if not cashed
     if (!cashedOut) {
       const live = new EmbedBuilder()
         .setTitle("📈 Crash")
         .setColor("Blue")
         .setDescription(
           `🎮 Player: <@${userId}>\n` +
-          `💰 Bet: **${bet}**\n\n` +
-          `Multiplier: **${multiplier.toFixed(2)}x**`
+            `💰 Bet: **${bet}**\n\n` +
+            `Multiplier: **${multiplier.toFixed(2)}x**`
         )
         .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
 
       await interaction.editReply({ embeds: [live], components: [row] });
     }
-  }, 1000); // 1s ticks
+  }, 1000);
 
   collector.on("collect", async (i) => {
     if (roundOver || cashedOut) return;
     cashedOut = true;
 
     winnings = Math.max(0, Math.floor(bet * multiplier));
-    // pay winnings (atomic)
-    await Wallet.updateOne({ userId }, { $inc: { cash: winnings } });
+    await Wallet.updateOne({ userId }, { $inc: { [currencyField]: winnings } });
 
-    // acknowledge & show immediate cashout
     const cashed = new EmbedBuilder()
       .setTitle("✅ Cashed Out!")
       .setColor("Green")
       .setDescription(
         `🎮 Player: <@${userId}>\n` +
-        `💰 Bet: **${bet}**\n\n` +
-        `Cashed out at **${multiplier.toFixed(2)}x**\n` +
-        `💸 Winnings: **${winnings}**`
+          `💰 Bet: **${bet}**\n\n` +
+          `Cashed out at **${multiplier.toFixed(2)}x**\n` +
+          `💸 Winnings: **${winnings}**`
       )
       .addFields({ name: "Recent Crashes", value: crashHistory.join(" • ") || "None yet" });
 
     await i.update({ embeds: [cashed], components: [] });
-
-    // Let the round continue until it actually crashes, then show final summary.
-    // If you prefer to end instantly after cashout, call stopRound("cashed") here.
+    // leave round running until it actually crashes; summary shown in stopRound()
   });
 
   collector.on("end", async (_collected, reason) => {
-    // If time ran out but round still not over, end gracefully
     if (!roundOver && reason === "time") {
       await stopRound("timeout");
     }
