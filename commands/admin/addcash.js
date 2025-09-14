@@ -5,6 +5,10 @@ import { ensureSafeInt, clamp, isAllowed, ok, logAction, WALLET_DEFAULTS } from 
 
 const MAX_ABS_DELTA = Number(process.env.ADMIN_MAX_ABS_DELTA ?? 1_000_000);
 
+// Clone defaults but exclude balance (to avoid conflict with $inc)
+const SAFE_WALLET_DEFAULTS = { ...WALLET_DEFAULTS };
+delete SAFE_WALLET_DEFAULTS.balance;
+
 export const data = new SlashCommandBuilder()
   .setName("addcash")
   .setDescription("Admin: Add balance to a user's wallet.")
@@ -26,7 +30,7 @@ export const data = new SlashCommandBuilder()
 
 export async function execute(interaction) {
   if (!isAllowed(interaction)) {
-    return interaction.reply({ content: "❌ Admins only.", ephemeral: true });
+    return interaction.reply({ content: "❌ Admins only.", flags: 64 });
   }
 
   try {
@@ -40,10 +44,10 @@ export async function execute(interaction) {
     // Get old balance
     const before = await Wallet.findOne({ userId: user.id }).lean();
 
-    // Update
+    // Update safely (no balance in $setOnInsert)
     const after = await Wallet.findOneAndUpdate(
       { userId: user.id },
-      { $setOnInsert: { userId: user.id, ...WALLET_DEFAULTS }, $inc: { balance: amount } },
+      { $setOnInsert: { userId: user.id, ...SAFE_WALLET_DEFAULTS }, $inc: { balance: amount } },
       { upsert: true, new: true }
     );
 
@@ -68,12 +72,12 @@ export async function execute(interaction) {
       .setFooter({ text: `Action by ${interaction.user.tag}` })
       .setTimestamp();
 
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: 64 });
   } catch (err) {
     console.error("[/addcash] error:", err);
     return interaction.reply({
-      content: "❌ Something went wrong while adding cash.",
-      ephemeral: true,
+      content: `❌ Something went wrong while adding cash: \`${err.message}\``,
+      flags: 64,
     });
   }
 }
